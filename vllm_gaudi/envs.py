@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+
+# Test pre-commit and signing-off commits
+
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
