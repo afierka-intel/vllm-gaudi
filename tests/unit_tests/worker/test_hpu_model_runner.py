@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 import habana_frameworks.torch  # noqa: F401
@@ -645,3 +647,145 @@ def test_model_torch_regional_compilation(default_vllm_config: None, dist_init, 
     assert_compilation(model, "lm_head", VocabParallelEmbedding)
     assert_compilation(model, "model.decoder.final_layer_norm", LayerNorm)
     assert_compilation(model, "model.decoder.embed_tokens", VocabParallelEmbedding)
+
+
+# ──────────────────────────────────────────────────────────
+# Multimodal embedding gathering tests (padded / non-padded)
+# ──────────────────────────────────────────────────────────
+
+
+def _setup_mm_embedding_mocks(total_len: int):
+    """Create mock model runner & scheduler for _gather_mm_embeddings tests.
+
+    Sets up 2 requests:
+      r0: mm_position offset=2, length=3, encoder output (3, 16)
+      r1: mm_position offset=1, length=4, encoder output (4, 16)
+    Both have num_computed_tokens=0.
+    """
+    mock_self = MagicMock()
+    mock_self.uses_mrope = False
+
+    embed_dim = 16
+    enc_out_r0 = torch.randn(3, embed_dim)
+    enc_out_r1 = torch.randn(4, embed_dim)
+    mock_self.encoder_cache = {"hash_0": enc_out_r0, "hash_1": enc_out_r1}
+
+    # mm features for r0: offset=2, length=3
+    mm_pos_r0 = MagicMock()
+    mm_pos_r0.offset = 2
+    mm_pos_r0.length = 3
+    mm_pos_r0.is_embed = None
+    mm_pos_r0.get_embeds_indices_in_range = lambda s, e: (s, e)
+
+    mm_feat_r0 = MagicMock()
+    mm_feat_r0.identifier = "hash_0"
+    mm_feat_r0.mm_position = mm_pos_r0
+
+    # mm features for r1: offset=1, length=4
+    mm_pos_r1 = MagicMock()
+    mm_pos_r1.offset = 1
+    mm_pos_r1.length = 4
+    mm_pos_r1.is_embed = None
+    mm_pos_r1.get_embeds_indices_in_range = lambda s, e: (s, e)
+
+    mm_feat_r1 = MagicMock()
+    mm_feat_r1.identifier = "hash_1"
+    mm_feat_r1.mm_position = mm_pos_r1
+
+    # request states
+    req_r0 = MagicMock()
+    req_r0.num_computed_tokens = 0
+    req_r0.mm_features = [mm_feat_r0]
+
+    req_r1 = MagicMock()
+    req_r1.num_computed_tokens = 0
+    req_r1.mm_features = [mm_feat_r1]
+
+    mock_self.requests = {"r0": req_r0, "r1": req_r1}
+
+    # is_mm_embed: CpuGpuBuffer mock
+    is_mm_embed_cpu = torch.zeros(total_len, dtype=torch.bool)
+    mock_is_mm_embed = MagicMock()
+    mock_is_mm_embed.cpu = is_mm_embed_cpu
+    mock_is_mm_embed.copy_to_gpu = MagicMock(return_value=is_mm_embed_cpu)
+    mock_self.is_mm_embed = mock_is_mm_embed
+
+    # scheduler output
+    scheduler_output = MagicMock()
+    scheduler_output.num_scheduled_tokens = {"r0": 10, "r1": 10}
+    scheduler_output.total_num_scheduled_tokens = 20
+
+    return mock_self, scheduler_output, enc_out_r0, enc_out_r1
+
+
+def test_gather_mm_embeddings_2d_padded():
+    """Test _gather_mm_embeddings with padded_seq_len (2D padded batching).
+
+    Two requests each padded to 16 tokens -> total = 32.
+    Expected is_mm_embed True positions:
+      r0 (batch_row=0): 0*16 + 2 = 2  -> [2, 3, 4]
+      r1 (batch_row=1): 1*16 + 1 = 17 -> [17, 18, 19, 20]
+    """
+    padded_seq_len = 16
+    padded_total = 2 * padded_seq_len  # 32
+
+    mock_self, sched_out, enc_r0, enc_r1 = _setup_mm_embedding_mocks(padded_total)
+
+    mm_embeds, _ = HPUModelRunner._gather_mm_embeddings(
+        mock_self,
+        scheduler_output=sched_out,
+        req_ids=["r0", "r1"],
+        shift_computed_tokens=0,
+        total_num_scheduled_tokens=padded_total,
+        padded_seq_len=padded_seq_len,
+    )
+
+    assert len(mm_embeds) == 2, f"Expected 2 mm_embeds, got {len(mm_embeds)}"
+    assert torch.equal(mm_embeds[0], enc_r0), "r0 encoder output mismatch"
+    assert torch.equal(mm_embeds[1], enc_r1), "r1 encoder output mismatch"
+
+    cpu = mock_self.is_mm_embed.cpu
+    expected_true = {2, 3, 4, 17, 18, 19, 20}
+    for i in range(padded_total):
+        if i in expected_true:
+            assert cpu[i].item(), f"Expected is_mm_embed=True at position {i}"
+        else:
+            assert not cpu[i].item(), f"Expected is_mm_embed=False at position {i}"
+
+    mock_self.is_mm_embed.copy_to_gpu.assert_called_once_with(padded_total)
+
+
+def test_gather_mm_embeddings_non_padded():
+    """Test _gather_mm_embeddings without padded_seq_len (original 1D path).
+
+    Two requests with 10 scheduled tokens each -> total = 20.
+    Expected is_mm_embed True positions:
+      r0 (req_start_idx=0):  0 + 2 = 2  -> [2, 3, 4]
+      r1 (req_start_idx=10): 10 + 1 = 11 -> [11, 12, 13, 14]
+    """
+    non_padded_total = 20
+
+    mock_self, sched_out, enc_r0, enc_r1 = _setup_mm_embedding_mocks(non_padded_total)
+
+    mm_embeds, _ = HPUModelRunner._gather_mm_embeddings(
+        mock_self,
+        scheduler_output=sched_out,
+        req_ids=["r0", "r1"],
+        shift_computed_tokens=0,
+        total_num_scheduled_tokens=non_padded_total,
+        padded_seq_len=None,
+    )
+
+    assert len(mm_embeds) == 2, f"Expected 2 mm_embeds, got {len(mm_embeds)}"
+    assert torch.equal(mm_embeds[0], enc_r0), "r0 encoder output mismatch"
+    assert torch.equal(mm_embeds[1], enc_r1), "r1 encoder output mismatch"
+
+    cpu = mock_self.is_mm_embed.cpu
+    expected_true = {2, 3, 4, 11, 12, 13, 14}
+    for i in range(non_padded_total):
+        if i in expected_true:
+            assert cpu[i].item(), f"Expected is_mm_embed=True at position {i}"
+        else:
+            assert not cpu[i].item(), f"Expected is_mm_embed=False at position {i}"
+
+    mock_self.is_mm_embed.copy_to_gpu.assert_called_once_with(non_padded_total)
